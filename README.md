@@ -1,16 +1,22 @@
-# EcoMarket RAG - entrega cuatro
+# **UNIVERSIDAD ICESI**
+## Maestría en Inteligencia Artificial Aplicada
+
+## Asignatura: IA Generativa 
+
+## Docente: David Miguel Ávila Crúz, MSc
+
+# EcoMarket RAG
 
 Proyecto taller 2 con flujo RAG.
 
-integrantes:
-MANUEL GONZALES GONZALEZ, 
-JUAN MANUEL HURTADO Y
-WILLIAN ALBERTO REINA GARCIA
+Integrantes:  
+Juan Manuel Hurtado Angulo  
+Manuel Alberto González González   
+William Alberto Reina García  
 
 ## Objetivo
 
-Permitir que el asistente:
-
+Permitir que el asistente:  
 1. Consulte una base interna antes de responder.
 2. Responda con evidencia cuando exista contexto.
 3. Declare limitacion cuando no tenga herramientas o informacion suficiente.

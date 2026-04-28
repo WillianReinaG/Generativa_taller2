@@ -2,6 +2,11 @@
 
 Proyecto taller 2 con flujo RAG.
 
+integrantes:
+MANUEL GONZALES GONZALEZ
+JUAN MANUEL HURTADO
+WILLIAN ALBERTO REINA GARCIA
+
 ## Objetivo
 
 Permitir que el asistente:

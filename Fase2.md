@@ -10,7 +10,7 @@ Este documento cumple la rúbrica de la fase 2 para el caso **EcoMarket**: ident
 
 
 
-## 1. Tipos de documentos relevantes (al menos tres)
+## 1. Tipos de documentos relevantes
 
 
 

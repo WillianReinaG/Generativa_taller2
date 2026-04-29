@@ -3,4 +3,7 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 data/chroma_db/
+data/chat_memory.json
+data/chat_memory.bak.json
 .env
+~$*

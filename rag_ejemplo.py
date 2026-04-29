@@ -14,8 +14,10 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain_core.documents import Document
@@ -34,6 +36,9 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 KB_DIR = ROOT / "kb"
 DB_DIR = DATA_DIR / "chroma_db"
+MEMORY_PATH = DATA_DIR / "chat_memory.json"
+MEMORY_BAK_PATH = DATA_DIR / "chat_memory.bak.json"
+HISTORY_LIMIT = 8
 
 # Markdown en kb/ generados desde xlsx/pdf (scripts/build_kb_from_json.py): no reindexar para evitar duplicados.
 _SKIP_KB_MD = frozenset(
@@ -47,6 +52,20 @@ CHUNK_SIZE_POLICY = 900
 CHUNK_OVERLAP_POLICY = 140
 
 _ORDER_ID_RE = re.compile(r"\bORD-\d+\b", re.IGNORECASE)
+
+
+@dataclass
+class CustomerProfile:
+    name: str
+    cedula: str
+    phone: str
+
+
+@dataclass
+class ConversationState:
+    customer: CustomerProfile
+    active_order_id: str | None = None
+    history: list[dict[str, str]] = field(default_factory=list)
 
 
 def _require_openai_key() -> None:
@@ -135,6 +154,114 @@ def _extract_order_id(text: str) -> str | None:
     return m.group(0).upper() if m else None
 
 
+def _normalize_text(value: str) -> str:
+    return " ".join(value.strip().split())
+
+
+def _normalize_digits_plus(value: str) -> str:
+    cleaned = "".join(ch for ch in value if ch.isdigit() or ch == "+")
+    if cleaned.count("+") > 1:
+        cleaned = cleaned.replace("+", "")
+    if "+" in cleaned and not cleaned.startswith("+"):
+        cleaned = cleaned.replace("+", "")
+    return cleaned
+
+
+def _state_to_dict(state: ConversationState) -> dict:
+    return {
+        "customer": {
+            "name": state.customer.name,
+            "cedula": state.customer.cedula,
+            "phone": state.customer.phone,
+        },
+        "active_order_id": state.active_order_id,
+        "history": state.history[-HISTORY_LIMIT:],
+    }
+
+
+def _state_from_dict(payload: dict) -> ConversationState | None:
+    customer = payload.get("customer")
+    if not isinstance(customer, dict):
+        return None
+    name = _normalize_text(str(customer.get("name", "")))
+    cedula = _normalize_digits_plus(str(customer.get("cedula", "")))
+    phone = _normalize_digits_plus(str(customer.get("phone", "")))
+    if not name or not cedula or not phone:
+        return None
+    history_raw = payload.get("history")
+    history: list[dict[str, str]] = []
+    if isinstance(history_raw, list):
+        for item in history_raw:
+            if not isinstance(item, dict):
+                continue
+            user = str(item.get("user", "")).strip()
+            assistant = str(item.get("assistant", "")).strip()
+            if user or assistant:
+                history.append({"user": user, "assistant": assistant})
+    active_order = payload.get("active_order_id")
+    active_order_id = str(active_order).strip().upper() if isinstance(active_order, str) else None
+    if active_order_id == "":
+        active_order_id = None
+    return ConversationState(
+        customer=CustomerProfile(name=name, cedula=cedula, phone=phone),
+        active_order_id=active_order_id,
+        history=history[-HISTORY_LIMIT:],
+    )
+
+
+def _read_memory_db() -> dict[str, dict]:
+    if not MEMORY_PATH.is_file():
+        return {}
+    try:
+        raw = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, dict):
+            out[k] = v
+    return out
+
+
+def _write_memory_db(db: dict[str, dict]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if MEMORY_PATH.is_file():
+            MEMORY_BAK_PATH.write_text(MEMORY_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception:
+        pass
+    MEMORY_PATH.write_text(
+        json.dumps(db, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _load_state_by_cedula(cedula: str) -> ConversationState | None:
+    db = _read_memory_db()
+    payload = db.get(cedula)
+    if not isinstance(payload, dict):
+        return None
+    return _state_from_dict(payload)
+
+
+def _save_state(state: ConversationState) -> None:
+    db = _read_memory_db()
+    db[state.customer.cedula] = _state_to_dict(state)
+    _write_memory_db(db)
+
+
+def _append_history(state: ConversationState, user_text: str, assistant_text: str) -> None:
+    state.history.append(
+        {
+            "user": user_text.strip(),
+            "assistant": assistant_text.strip(),
+        }
+    )
+    state.history = state.history[-HISTORY_LIMIT:]
+
+
 def _embedding_model() -> OpenAIEmbeddings:
     model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
     return OpenAIEmbeddings(model=model)
@@ -213,6 +340,16 @@ Reglas:
    puedas cumplir.
 3) No finjas acceso a sistemas externos, enlaces de pago, ejecucion de devoluciones ni modificacion de datos;
    solo orientas con la base cuando el diagnostico lo permite.
+4) Si hay un pedido activo de la conversacion, manten coherencia con ese pedido salvo que el cliente mencione otro.
+
+Perfil del cliente (si existe):
+{customer_profile}
+
+Pedido activo en la conversacion (si existe):
+{active_order_id}
+
+Historial reciente (resumen):
+{recent_history}
 
 Contexto interno (puede estar vacio):
 {context}
@@ -223,11 +360,32 @@ Mensaje del cliente:
     )
 
 
-def ask(question: str, *, threshold: float = 0.2) -> str:
+def ask(
+    question: str,
+    *,
+    threshold: float = 0.2,
+    conversation_state: ConversationState | None = None,
+) -> str:
     vs = _vectorstore()
     llm = _chat_model()
 
-    order_id = _extract_order_id(question)
+    user_question = question.strip()
+    working_question = user_question
+
+    if conversation_state:
+        explicit_order_id = _extract_order_id(user_question)
+        if explicit_order_id:
+            conversation_state.active_order_id = explicit_order_id
+        elif conversation_state.active_order_id:
+            working_question = (
+                f"{user_question}\n\n"
+                f"Referencia conversacional: pedido_id: {conversation_state.active_order_id}"
+            )
+
+    order_id = _extract_order_id(working_question)
+    if not order_id and conversation_state and conversation_state.active_order_id:
+        order_id = conversation_state.active_order_id
+
     context_docs: list[Document] = []
     used_order_filter = False
 
@@ -262,7 +420,7 @@ def ask(question: str, *, threshold: float = 0.2) -> str:
 
     if not used_order_filter:
         try:
-            scored_docs = vs.similarity_search_with_relevance_scores(question, k=4)
+            scored_docs = vs.similarity_search_with_relevance_scores(working_question, k=4)
         except Exception:
             scored_docs = []
 
@@ -272,7 +430,7 @@ def ask(question: str, *, threshold: float = 0.2) -> str:
         low_relevance = best_score is not None and best_score < threshold
 
         retriever = vs.as_retriever(search_kwargs={"k": 4})
-        context_docs = retriever.invoke(question)
+        context_docs = retriever.invoke(working_question)
 
     if context_docs and (used_order_filter or not low_relevance):
         context_text = "\n\n".join(doc.page_content for doc in context_docs)
@@ -301,9 +459,35 @@ def ask(question: str, *, threshold: float = 0.2) -> str:
             "indica cuando convenga contactar a atencion humana."
         )
 
+    customer_profile = "No informado."
+    active_order_for_prompt = "No definido."
+    recent_history = "Sin historial."
+    if conversation_state:
+        customer_profile = (
+            f"nombre={conversation_state.customer.name}; "
+            f"cedula={conversation_state.customer.cedula}; "
+            f"telefono={conversation_state.customer.phone}"
+        )
+        if conversation_state.active_order_id:
+            active_order_for_prompt = conversation_state.active_order_id
+        if conversation_state.history:
+            pieces: list[str] = []
+            for item in conversation_state.history[-4:]:
+                user = item.get("user", "")
+                assistant = item.get("assistant", "")
+                pieces.append(f"Cliente: {user}\nAsistente: {assistant}")
+            recent_history = "\n\n".join(pieces)
+
     chain = _prompt() | llm | StrOutputParser()
     answer = chain.invoke(
-        {"context": context_text, "input": question, "context_status": context_status}
+        {
+            "context": context_text,
+            "input": user_question,
+            "context_status": context_status,
+            "customer_profile": customer_profile,
+            "active_order_id": active_order_for_prompt,
+            "recent_history": recent_history,
+        }
     ).strip()
     if not answer:
         answer = (
@@ -321,15 +505,49 @@ def ask(question: str, *, threshold: float = 0.2) -> str:
 
 
 def repl() -> None:
-    print("EcoMarket RAG REPL. Escribe 'salir' para terminar.")
+    print("EcoMarket RAG REPL con memoria por usuario. Escribe 'salir' para terminar.")
+    print("Comando util: /reset para limpiar pedido activo e historial de este usuario.\n")
+
+    name = _normalize_text(input("Nombre del cliente: "))
+    cedula = _normalize_digits_plus(input("Cedula del cliente: "))
+    phone = _normalize_digits_plus(input("Telefono del cliente: "))
+    if not name or not cedula or not phone:
+        print("Error: nombre, cedula y telefono son obligatorios para iniciar la sesion.")
+        return
+
+    state = _load_state_by_cedula(cedula)
+    if state:
+        state.customer.name = name
+        state.customer.phone = phone
+        print(f"Sesion recuperada para cedula {cedula}.")
+        if state.active_order_id:
+            print(f"Pedido activo recuperado: {state.active_order_id}")
+    else:
+        state = ConversationState(customer=CustomerProfile(name=name, cedula=cedula, phone=phone))
+        print(f"Sesion nueva creada para cedula {cedula}.")
+
     while True:
         line = input("Tu: ").strip()
         if not line or line.lower() in {"salir", "exit", "quit"}:
             break
+        if line.lower() == "/reset":
+            state.active_order_id = None
+            state.history = []
+            try:
+                _save_state(state)
+            except Exception:
+                pass
+            print("Asistente: Contexto conversacional limpiado para este usuario.\n")
+            continue
         try:
-            out = ask(line)
+            out = ask(line, conversation_state=state)
         except Exception as exc:
             out = f"Error: {exc}"
+        _append_history(state, line, out)
+        try:
+            _save_state(state)
+        except Exception as exc:
+            print(f"Asistente: Advertencia al guardar memoria local: {exc}")
         print(f"Asistente: {out}\n")
 
 

@@ -30,6 +30,7 @@ Permitir que el asistente:
 5. **Fragmentacion**: en `rag_ejemplo.py`, `RecursiveCharacterTextSplitter` con tamanos distintos para **pedidos (Excel)** vs **PDF/Markdown**; en consultas con `ORD-xxxxx` se usa filtro por metadata `order_id` antes de confiar solo en similitud semantica.
 6. **Vector DB**: Chroma local en `data/chroma_db/`.
 7. **Generacion**: LangChain retrieval chain (`rag_ejemplo.py`).
+8. **Interfaz web (opcional)**: `app.py` con Streamlit; usa las mismas funciones `ingest()` y `ask()` del modulo `rag_ejemplo.py`.
 
 ## Instalacion
 
@@ -72,6 +73,42 @@ python rag_ejemplo.py ask -q "Cual es el estado del pedido ORD-00001?"
 ```powershell
 python rag_ejemplo.py repl
 ```
+
+## Interfaz web (`app.py`)
+
+La aplicacion Streamlit permite indexar y consultar sin usar la terminal.
+
+### Arranque
+
+```powershell
+streamlit run app.py
+```
+
+Se abre en el navegador (por defecto `http://localhost:8501`). Requiere las mismas variables de `.env` que el CLI (sobre todo `OPENAI_API_KEY`). Las dependencias incluyen `streamlit` (ver `requirements.txt`).
+
+### Que hace la interfaz
+
+- **Barra lateral — Indexar base de conocimiento**: ejecuta `ingest()`, igual que `python rag_ejemplo.py ingest`. Reconstruye el indice en `data/chroma_db/` a partir de `data/` y markdown en `kb/` (segun la logica de `rag_ejemplo.py`).
+- **Consulta del cliente — Enviar consulta**: ejecuta `ask(pregunta)` sobre el indice ya creado, equivalente funcional a `python rag_ejemplo.py ask -q "..."`.
+
+### Relacion con `repl`
+
+En la version actual de `app.py`, cada envio llama a `ask(pregunta)` **sin** `conversation_state`. Por tanto **no replica** la memoria por cedula, el pedido activo entre turnos ni el comando `/reset` del modo `repl`. Para ese comportamiento conviene usar `python rag_ejemplo.py repl` o extender `app.py` para cargar y guardar estado como hace el REPL.
+
+## Memoria conversacional (repl)
+
+- `repl` ahora solicita al inicio: **nombre, cedula y telefono**.
+- La memoria se guarda por usuario (clave: cedula) en `data/chat_memory.json`.
+- Si en una pregunta mencionas `ORD-xxxxx`, ese pedido queda como **pedido activo**.
+- En preguntas siguientes, si no indicas `ORD-xxxxx`, el sistema reutiliza el pedido activo.
+- Comando `/reset` dentro de `repl`: limpia pedido activo e historial del usuario actual.
+
+### Ejemplo de continuidad
+
+1. `Que materia viene en el pedido ORD-00080?`
+2. `Cuando llega?`
+
+En el paso 2, el asistente mantiene el contexto de `ORD-00080`.
 
 ## Notebook alterno con LlamaIndex
 
